@@ -67,4 +67,5 @@ gtfs_path = GtfsArchiveFetcher.fetch_and_extract(args.gtfs_url, "gtfs/")
 query_engine = TimeTableQueryEngine(gtfs_path, realtime_data_fetcher, reduce_memory_usage=args.uncached)
 
 app.config["DEBUG"] = False
-app.run()
+# app.run() # Bind only to localhost
+app.run(host="0.0.0.0") # Bind to all interfaces
