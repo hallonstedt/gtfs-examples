@@ -1,4 +1,4 @@
 Flask==3.0.3
 gtfs-realtime-bindings==1.0.0
-urllib3==2.2.25
+urllib3==2.2.2
 requests==2.31.0
