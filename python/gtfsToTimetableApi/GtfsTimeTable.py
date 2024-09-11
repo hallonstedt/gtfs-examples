@@ -72,7 +72,7 @@ class GtfsArchiveFetcher:
         if is_outdated:
             logging.info("GTFS archive is older than 1 day")
         else:
-            logging.info("GTFS archive is less than 1 day old")
+            logging.debug("GTFS archive is less than 1 day old") # Since we check this on every call loglevel is set to DEBUG when the archive is up to date
         return is_outdated
 
 
