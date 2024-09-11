@@ -1,5 +1,4 @@
 import argparse
-import datetime
 import logging
 import os
 import sys
@@ -122,13 +121,59 @@ class TimeTableQueryEngine:
         query_stop_ids = self._get_queried_stop_ids(query_stop_id)
         # Get the stop times at these stops
         stop_times = self._get_stop_times_for_stops(query_stop_ids)
+        #print(stop_times)
         # Only retain stop times in the time window
         stop_times_in_window = self._filter_stop_times_window(stop_times, window_start, window_end)
         # Sort the stop times
         # Only sort when we have filtered out the interesting ones, to prevent wasting time on unnecessary sorting
-        stop_times_in_window.sort(key=lambda item: item['departure_seconds'])
+        sorted_stop_times_in_window = self._amend_and_sort_stop_times(stop_times_in_window, window_start, window_end)
         # Compile a response based on the stop times and query ids.
-        return self._compile_results(stop_times_in_window, query_stop_ids)
+        #return self._compile_results(sorted_stop_times_in_window, query_stop_ids), stop_times, sorted_stop_times_in_window
+        return self._compile_results(sorted_stop_times_in_window, query_stop_ids)
+
+    def _amend_and_sort_stop_times(self, stop_times_in_window: list, window_start: datetime, window_end: datetime) -> list:
+        """
+        This method will add actual time to the list, changing stop_times past midnight from 24+ format to regular hourly times, i.e. 25:10:00 -> 01:10:00
+        It will also sort stop_times based on whether the window spans across midnight or not.
+        :param stop_times_in_window: The list of stop times to adjust and sort.
+        :param window_start: The start of the time window.
+        :param window_end: End of the time window
+        :return: The sorted list with adjusted_departure_time and adjusted_departure_seconds added to it.
+        """
+        logging.debug("Sorting filtered stop times chronologically")
+        window_start_secs = window_start.hour * 3600 + window_start.minute * 60 + window_start.second
+        window_end_secs = window_end.hour * 3600 + window_end.minute * 60 + window_end.second
+
+        amended_stop_times = []
+
+        for stop_time in stop_times_in_window:
+            departure_seconds = stop_time['departure_seconds']
+
+            # Normalize times greater than 24:00:00 (e.g., 25:00:00 -> 01:00:00)
+            if departure_seconds >= 86400:
+                adjusted_departure_seconds = departure_seconds - 86400
+                adjusted_departure_time = self._seconds_to_time_string(adjusted_departure_seconds)
+                logging.debug(f"adjusted departure time is {adjusted_departure_time}")
+            else:
+                adjusted_departure_seconds = departure_seconds
+                adjusted_departure_time = stop_time['departure_time']
+
+            # If the window spans midnight, adjust the sorting order
+            if window_start_secs > window_end_secs:  # Window spans midnight
+                if adjusted_departure_seconds < window_start_secs:
+                    # This ensures that times after midnight are considered as "next day" times
+                    adjusted_departure_seconds += 86400  # Add 24 hours to push past midnight times later
+
+            # Update the dictionary with the new departure time and seconds
+            stop_time['adjusted_departure_seconds'] = adjusted_departure_seconds
+            stop_time['adjusted_departure_time'] = adjusted_departure_time
+
+            amended_stop_times.append(stop_time)
+
+        # Sort stop times by the adjusted departure time
+        sorted_stop_times = sorted(amended_stop_times, key=lambda x: x['adjusted_departure_seconds'])
+
+        return sorted_stop_times
 
     def _get_queried_stop_ids(self, query_id: str) -> list:
         """
@@ -161,6 +206,7 @@ class TimeTableQueryEngine:
 
         # Check if the time window spans across midnight
         window_crosses_midnight = window_end.date() > window_start.date()
+
         # Calculate the seconds from midnight. This way we can do all later comparisons using integers
         window_start_secs_since_midnight = window_start.time().hour * 3600 \
                                            + window_start.time().minute * 60 \
@@ -173,66 +219,60 @@ class TimeTableQueryEngine:
         # Get the day before the start date, needed to check if a trip that spans multiple days was active on this day.
         day_before_start = window_start.date() - timedelta(days=1)
 
-        filtered_stop_times = list()
+        filtered_stop_times = []
+
         for stop_time in stop_times:
-            # We already calculated the seconds from midnight in the StopTimesCache.
             secs_since_midnight = stop_time['departure_seconds']
-            # The first, easy, check is to see if the time lies between the start and end time.
-            # If this fails, we can skip all other checks
-            if not self._is_time_in_window(secs_since_midnight,
+            hour_int = secs_since_midnight // 3600
+
+            # Normalize times greater than 24:00:00 (e.g., 25:25:00 -> 01:25:00)
+            if secs_since_midnight >= 86400:
+                adjusted_secs_since_midnight = secs_since_midnight - 86400
+            else:
+                adjusted_secs_since_midnight = secs_since_midnight
+
+            # Check if the time is within the window
+            if not self._is_time_in_window(adjusted_secs_since_midnight,
                                            window_start_secs_since_midnight,
-                                           window_end_secs_since_midnight):
+                                           window_end_secs_since_midnight,
+                                           window_crosses_midnight):
                 continue
 
-            # Alright, so the time is valid. Is the trip actually ran on that day? Get the service id so we can check
+            # Handle service checks for both cases: before and after midnight
             trip = self._trips_cache.get_trip(stop_time['trip_id'])
             service_id = trip['service_id']
 
-            # Get the hour part from the time. If it is more than 23, it is a trip that started the day before.
-            hour_int = secs_since_midnight // 3600
-
-            # This is a trip that started the same day
+            # If the stop time is before midnight
             if hour_int < 24:
-                # If the window doesn't cross midnight, the departure date is the same as the date of the window start.
-                # Check if the service_id is active that day
-                if not window_crosses_midnight \
-                        and self._calendar_dates_cache.is_serviced(service_id, window_start.date()):
-                    filtered_stop_times.append(stop_time)
-                # If it crosses midnight, we need to determine the departure date first
+                if not window_crosses_midnight:
+                    if self._calendar_dates_cache.is_serviced(service_id, window_start.date()):
+                        filtered_stop_times.append(stop_time)
                 elif window_crosses_midnight:
-                    # We have constrained the time window to no more than 24h. This means that, if the time window
-                    # crosses midnight, the end time will lie before the start time. This simplifies the following tests
-                    if secs_since_midnight >= window_start_secs_since_midnight:
+                    if adjusted_secs_since_midnight >= window_start_secs_since_midnight:
                         if self._calendar_dates_cache.is_serviced(service_id, window_start.date()):
                             filtered_stop_times.append(stop_time)
                     else:
-                        if self._calendar_dates_cache.is_serviced(service_id, window_start.date()):
+                        if self._calendar_dates_cache.is_serviced(service_id, window_end.date()):
                             filtered_stop_times.append(stop_time)
-            # This is a trip that started the day before (it's past midnight),
-            # check if it was active on the day it started
+            # If the stop time is after midnight (adjusted from > 24:00:00)
             elif hour_int >= 24:
-                if not window_crosses_midnight and self._calendar_dates_cache.is_serviced(service_id,
-                                                                                          day_before_start):
+                if not window_crosses_midnight and self._calendar_dates_cache.is_serviced(service_id, day_before_start):
                     filtered_stop_times.append(stop_time)
-                # Alright, so the window crosses midnight and this trip started the day before.
-                # Since this trip planner is restricted to 1-day intervals, we know the day before is start date
                 elif window_crosses_midnight:
-                    # We have constrained the time window to no more than 24h. This means that, if the time window
-                    # crosses midnight, the end time will lie before the start time. This simplifies the following tests
-                    # First day. Comparison corrects for the 24h offset since the hour part is larger than 24h
-                    if secs_since_midnight - 86400 >= window_start_secs_since_midnight:
+                    if adjusted_secs_since_midnight >= window_start_secs_since_midnight:
                         if self._calendar_dates_cache.is_serviced(service_id, day_before_start):
                             filtered_stop_times.append(stop_time)
-                    # Second day
                     else:
                         if self._calendar_dates_cache.is_serviced(service_id, window_start.date()):
                             filtered_stop_times.append(stop_time)
+
         return filtered_stop_times
 
     def _is_time_in_window(self,
                            seconds_since_midnight: int,
                            window_start_since_midnight: int,
-                           window_end_since_midnight: int
+                           window_end_since_midnight: int,
+                           window_crosses_midnight: bool
                            ) -> bool:
         """
         Check if a time (in seconds from midnight) lies in a window. window_end can lie before window_start if
@@ -241,11 +281,14 @@ class TimeTableQueryEngine:
         :param window_start_since_midnight: Start of the window
         :param window_end_since_midnight:  End of the window, less than 24h after the start. Can be smaller than
                                            window_start_since_midnight if it is a time during the next day.
+        :param window_crosses_midnight: Helper boolean to determine if we need to deal with sop_times past midnight
         :return: True if the timestamp lies in the window.
         """
-        return window_start_since_midnight <= seconds_since_midnight < window_end_since_midnight \
-               or (window_start_since_midnight > window_end_since_midnight > seconds_since_midnight >= 0) \
-               or (window_end_since_midnight < window_start_since_midnight <= seconds_since_midnight < 24 * 3600)
+        if not window_crosses_midnight:
+            return window_start_since_midnight <= seconds_since_midnight < window_end_since_midnight
+        else:
+            return seconds_since_midnight >= window_start_since_midnight or seconds_since_midnight < window_end_since_midnight
+
 
     def _compile_results(self, stop_times: list, searched_stop_ids: list) -> object:
         """
@@ -269,7 +312,7 @@ class TimeTableQueryEngine:
             entries.append({
                 "direction": stop_time['stop_headsign'],
                 "scheduled_departure_time": stop_time['departure_time'],
-                "realtime_departure_time": self._add_seconds(stop_time['departure_time'], delay),
+                "realtime_departure_time": self._add_seconds(stop_time['adjusted_departure_time'], delay),
                 "stop": stop,
                 "type": ROUTE_TYPE_NAMES[int(route['route_type'])],
                 "route_long": route['route_long_name'],
@@ -323,6 +366,16 @@ class TimeTableQueryEngine:
         """Get Seconds from time, for faster calculations later on."""
         h, m, s = time_str.split(':')
         return int(h) * 3600 + int(m) * 60 + int(s)
+
+    def _seconds_to_time_string(self, seconds: int) -> str:
+        """
+        Helper function to convert seconds since midnight to hh:mm:ss format
+        :param seconds: Seconds to add (or subtract) to the given time
+        :return: The time with seconds added in hh:mm:ss format
+        """
+        m, s = divmod(seconds, 60)
+        h, m = divmod(m, 60)
+        return f'{h:02d}:{m:02d}:{s:02d}'
 
 
 if __name__ == '__main__':
