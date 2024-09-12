@@ -1,5 +1,5 @@
 # GTFS Timetable API demo
-**This example shows how to use GTFS, GTFS-RT TripUpdates (delays), GTFS-RT VehiclePositions (GPS positions), GTFS-RT VehiclePositions (Occupancy data).**
+**This example shows how to use GTFS (static time tables), GTFS-RT TripUpdates (delays), GTFS-RT VehiclePositions (GPS positions), GTFS-RT VehiclePositions (Occupancy data).**
 
 
 This project is a little tech demo, showing how GTFS and GTFS-RT data can be used to create a timetable API. The
@@ -7,11 +7,16 @@ timetable API shows a list of realtime departures from a given stop, along with 
 of the vehicle if it's available. No pre-processing or data conversion is needed.
 
 The demo consists of a module that builds timetables from scheduled GTFS data (`GtfsTimeTable.py`) and a module that
-fetches and parses realtime data (`RealtimeDataFetcher.py`). A helper class
+fetches and parses realtime data (`RealtimeDataFetcher.py`) providing a helper class.
 
 The purpose of this demo is to show how GTFS and GTFS-RT are related, and how compact GTFS files can be "inflated" to
 timetable data. This project is not meant to be used in a production environment, but it can either inspire and help
 while building a production-ready solution. It can be tweaked to be production-ready.
+
+**IMPORTANT!** Only operators that provide real-time data are currently supported by this software. In September 2024
+the available options are: jlt, klt, krono, orebro, skane, sl, ul, vastmanland, varm, xt and otraf. Visit [Trafiklab's website](https://www.trafiklab.se/api/gtfs-datasets/gtfs-regional)
+for an updated list of operators.
+
 
 ## Installation
 
@@ -22,30 +27,26 @@ while building a production-ready solution. It can be tweaked to be production-r
 
 ## Running
 
-- Run the `TimeTableApi` flask app to start a
-  webserver: `python3 TimeTableApi.py --gtfs="<URL to GTFS.zip>" --vehicle-positions="<URL to vehiclepositions.pb>" --trip-updates="<URL to tripupdates.pb>"`
-- Or use the GtfsTimeTable module direct from the command
-  line: `python3 GtfsTimeTable.py --gtfs="<URL to GTFS.zip>" --vehicle-positions="<URL to vehiclepositions.pb>" --trip-updates="<URL to tripupdates.pb>" --stop-id="<id of stop to get departures for>"`
+- Edit the `gtfs.conf` file to match your preferred operator. You also need to obtain API-keys from [trafiklab.se](https://www.trafiklab.se/docs/getting-started/using-trafiklab) which means
+  registering an account, creating a project and requesting the two keys required for static and real-time data.
+- Run the TimeTableApi flask app to start a webserver: `python3 TimeTableApi.py`, or `nohup python3 TimeTableApi.py &` which will fork the process to the background and send logging output to *nohup.out*.
+- Or use the GtfsTimeTable module direct from the command line: `python3 GtfsTimeTable.py` where you will be asked for an id of the stop to get departures for. You may obtain the stop id from the `/stops` endpoint. See below.
 
 Note: All GTFS data is cached:
 
-- A new GTFS file is only fetched once per day
+- A new GTFS file (the static time table) is only fetched once per day
 - New tripupdates data is only fetched on demand, no more than once per minute
 - New vehiclepositions data is only fetched on demand, no more than once per 15s
 
 ## Webserver endpoints
 
-The Flask webapp contains two endpoints:
+The Flask webapp contains three endpoints:
 
 - The `/stops` endpoint lists all stops which you can search for
-- The `/departures/<stop-id>` endpoint shows the departures from the past 10 minutes to the next 2 hours for the given
-  stop.
+- The `/departures` endpoint shows the departures from the previous 10 minutes to the next 2 hours for the stop configured in gtfs.conf
+- The `/departures/<stop-id>` endpoint shows the departures from the previous 10 minutes to the next 2 hours for the stop given in the URL request
 
-**Important! ** If you want to reach the development server from another machine in your network, you need to edit the
-last line in `TimeTableApi.py` from `app.run()` to `app.run(host="0.0.0.0")`
-
-A response from the `/departures/<stop-id>` endpoint contains all the platforms that were searched, and all the
-departures from those platforms. It looks like this:
+A response from the `/departures` endpoint contains all the platforms that were searched, and all the departures from those platforms. It looks like this:
 
 ```json
 {
@@ -120,6 +121,5 @@ Some notes:
 - Realtime data is fetched on-demand. This causes the high spikes seen in the metrics above. Periodically updating
   realtime data on a separate thread will remove this spikes, and result in a consistent response time under 25ms
 
-- The API can be run with an `--uncached` parameter. This will reduce memory usage, but increases computing time. It is
+- The API can be run with an `uncached` configured in gtfs.conf. This will reduce memory usage, but increases computing time. It is
   only recommended when you will make no more than 1 request, or on devices that have insufficient memory for caching.
-  
