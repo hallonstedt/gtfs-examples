@@ -46,6 +46,11 @@ The Flask webapp contains three endpoints:
 - The `/departures` endpoint shows the departures from the previous 10 minutes to the next 2 hours for the stop configured in gtfs.conf
 - The `/departures/<stop-id>` endpoint shows the departures from the previous 10 minutes to the next 2 hours for the stop given in the URL request
 
+Optional query parameters for `/departures`:
+
+- `destination_stop_id=<stop-id>` adds predicted arrival data at a destination stop for each listed departure. This is useful when your UI should show both departure and destination arrival without hard-coded travel time.
+- If `destination_stop_id` is unknown, the API returns an error.
+
 A response from the `/departures` endpoint contains all the platforms that were searched, and all the departures from those platforms. It looks like this:
 
 ```json
@@ -123,3 +128,30 @@ Some notes:
 
 - The API can be run with an `uncached` configured in gtfs.conf. This will reduce memory usage, but increases computing time. It is
   only recommended when you will make no more than 1 request, or on devices that have insufficient memory for caching.
+
+
+## Using realtime arrival in a PHP frontend
+
+When requesting departures, include the destination stop id:
+
+```
+http://python.hellerstedt.se:5000/departures/9021012033077000?destination_stop_id=9021012080000000
+```
+
+When `destination_stop_id` is provided, each departure then includes:
+
+- `scheduled_destination_arrival_time`
+- `realtime_destination_arrival_time`
+- `destination_delay`
+- `destination_stop`
+
+In your PHP script, replace the fixed `+34*60` arrival calculation with:
+
+```php
+$arrival_time = $array['realtime_destination_arrival_time'] ?? null;
+if ($arrival_time === null) {
+    $arrival_time = date('H:i', $realtime_departure_time + 34 * 60); // fallback
+} else {
+    $arrival_time = date('H:i', fulldate($arrival_time));
+}
+```

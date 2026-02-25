@@ -44,7 +44,13 @@ def departures(stop_id):
 	# The TimeTableQueryEngine class does not update the window dynamically so we send updated start and stop times from this call
 	window_start = datetime.now() - timedelta(minutes=10)
 	window_end = datetime.now() + timedelta(hours=config.getint('DEFAULT', 'window_size_hours'))
-	resp = flask.Response(json.dumps(query_engine.create_departures_timetable(stop_id, window_start, window_end)))
+	destination_stop_id = flask.request.args.get('destination_stop_id')
+	resp = flask.Response(json.dumps(query_engine.create_departures_timetable(
+		stop_id,
+		window_start,
+		window_end,
+		destination_stop_id=destination_stop_id
+	)))
 	resp.headers['Content-encoding'] = 'UTF-8'
 	resp.headers['Content-type'] = 'Application/json'
 	return resp
@@ -60,7 +66,7 @@ def stops():
 @app.errorhandler(ValueError)
 def handle_value_error(e):
     # Return the error message (not the full traceback)
-    return f"Error: {str(e)}", 500
+    return f"Error: {str(e)}", 400
 
 @app.errorhandler(500)
 def handle_500_error(e):

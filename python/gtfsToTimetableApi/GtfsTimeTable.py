@@ -105,7 +105,8 @@ class TimeTableQueryEngine:
     def create_departures_timetable(self,
                                     query_stop_id: str,
                                     window_start: datetime = datetime.now() - timedelta(minutes=10),
-                                    window_end: datetime = datetime.now() + timedelta(hours=2)) -> object:
+                                    window_end: datetime = datetime.now() + timedelta(hours=2),
+                                    destination_stop_id: str = None) -> object:
         """
         Create a TimeTable with departure information for a given stop.
         :param query_stop_id:  The id of the stop to search for. All quays in this stop will be automatically included.
@@ -128,8 +129,15 @@ class TimeTableQueryEngine:
         # Only sort when we have filtered out the interesting ones, to prevent wasting time on unnecessary sorting
         sorted_stop_times_in_window = self._amend_and_sort_stop_times(stop_times_in_window, window_start, window_end)
         # Compile a response based on the stop times and query ids.
+        destination_stop_ids = None
+        if destination_stop_id:
+            try:
+                destination_stop_ids = self._get_queried_stop_ids(destination_stop_id)
+            except KeyError as e:
+                raise ValueError(f"Unknown destination_stop_id: {destination_stop_id}") from e
+
         #return self._compile_results(sorted_stop_times_in_window, query_stop_ids), stop_times, sorted_stop_times_in_window
-        return self._compile_results(sorted_stop_times_in_window, query_stop_ids)
+        return self._compile_results(sorted_stop_times_in_window, query_stop_ids, destination_stop_ids)
 
     def _amend_and_sort_stop_times(self, stop_times_in_window: list, window_start: datetime, window_end: datetime) -> list:
         """
@@ -293,15 +301,19 @@ class TimeTableQueryEngine:
             return seconds_since_midnight >= window_start_since_midnight or seconds_since_midnight < window_end_since_midnight # MH
 
 
-    def _compile_results(self, stop_times: list, searched_stop_ids: list) -> object:
+    def _compile_results(self, stop_times: list, searched_stop_ids: list, destination_stop_ids: list = None) -> object:
         """
         Inflate a list of stop times (which are already filtered on location and time) to an API response.
         :param stop_times:  The stop times to include in the API response.
         :param searched_stop_ids:  The stop ids for which departures were calculated.
+        :param destination_stop_ids: Optional destination stopplace + quay ids used for realtime arrival lookup.
         :return: The API response
         """
         logging.debug("Compiling results")
         entries = list()
+        destination_stop_ids_set = set(destination_stop_ids) if destination_stop_ids else set()
+        destination_stop_by_trip = dict()
+
         for stop_time in stop_times:
             # Get additional information for each stop
             trip = self._trips_cache.get_trip(stop_time['trip_id'])
@@ -312,7 +324,33 @@ class TimeTableQueryEngine:
             position = self._realtime_fetcher.get_position_for_trip(trip['trip_id'])
             occupancy = self._realtime_fetcher.get_occupancy_for_trip(trip['trip_id'])
 
-            entries.append({
+            destination_realtime_arrival_time = None
+            destination_scheduled_arrival_time = None
+            destination_delay = None
+            destination_stop = None
+
+            if destination_stop_ids_set:
+                if trip['trip_id'] not in destination_stop_by_trip:
+                    destination_stop_by_trip[trip['trip_id']] = self._find_destination_stop_time(
+                        trip['trip_id'],
+                        stop_time,
+                        destination_stop_ids_set
+                    )
+
+                destination_stop_time = destination_stop_by_trip[trip['trip_id']]
+                if destination_stop_time:
+                    destination_scheduled_arrival_time = self._normalize_time_string(destination_stop_time['arrival_time'])
+                    destination_delay = self._realtime_fetcher.get_delay_for_trip_stop(
+                        trip['trip_id'],
+                        destination_stop_time['stop_sequence']
+                    )
+                    destination_realtime_arrival_time = self._add_seconds(
+                        destination_scheduled_arrival_time,
+                        destination_delay
+                    )
+                    destination_stop = self._gtfs_stop_id_to_api_stop(destination_stop_time['stop_id'])
+
+            entry = {
                 "direction": stop_time['stop_headsign'],
                 "scheduled_departure_time": stop_time['departure_time'],
                 "realtime_departure_time": self._add_seconds(stop_time['adjusted_departure_time'], delay),
@@ -322,8 +360,16 @@ class TimeTableQueryEngine:
                 "route_short": route['route_short_name'],
                 "delay": delay,
                 "position": position,
-                "occupancy": occupancy
-            })
+                "occupancy": occupancy,
+            }
+
+            if destination_stop_ids_set:
+                entry["destination_stop"] = destination_stop
+                entry["scheduled_destination_arrival_time"] = destination_scheduled_arrival_time
+                entry["realtime_destination_arrival_time"] = destination_realtime_arrival_time
+                entry["destination_delay"] = destination_delay
+
+            entries.append(entry)
 
         # Wrap departures and stops in one object
         return {"stops": [self._gtfs_stop_id_to_api_stop(stop_id) for stop_id in searched_stop_ids],
@@ -346,6 +392,36 @@ class TimeTableQueryEngine:
             "latitude": stop["stop_lat"],
             "longitude": stop["stop_lon"],
         }
+
+    def _normalize_time_string(self, time: str) -> str:
+        """
+        Normalize times >= 24:00:00 to the next day's 00:00:00-23:59:59 range.
+        :param time: A time string in hh:mm:ss (hour can be > 23)
+        :return: A time in hh:mm:ss format where 00 <= hh <= 23
+        """
+        time_seconds = self.get_seconds_since_midnight(time)
+        time_seconds = time_seconds % (24 * 3600)
+        m, s = divmod(time_seconds, 60)
+        h, m = divmod(m, 60)
+        return f'{h:02d}:{m:02d}:{s:02d}'
+
+    def _find_destination_stop_time(self, trip_id: str, departure_stop_time: dict, destination_stop_ids: set):
+        """
+        Locate the first matching destination stop in a trip after the queried departure stop.
+        :param trip_id: The GTFS trip id
+        :param departure_stop_time: Stop-time record used as origin
+        :param destination_stop_ids: Destination stop ids (stop place + quays)
+        :return: The matching destination stop-time row, or None if no match exists.
+        """
+        departure_sequence = int(departure_stop_time['stop_sequence'])
+        stop_times_for_trip = self._stop_times_cache.get_stop_times_for_trip(trip_id)
+
+        for candidate_stop_time in stop_times_for_trip:
+            if int(candidate_stop_time['stop_sequence']) <= departure_sequence:
+                continue
+            if candidate_stop_time['stop_id'] in destination_stop_ids:
+                return candidate_stop_time
+        return None
 
     def _add_seconds(self, time: str, seconds: int) -> str:
         """
