@@ -1,7 +1,9 @@
 import time
+import logging
 
 import requests
 from google.transit import gtfs_realtime_pb2
+from google.protobuf.message import DecodeError
 
 # This map describes the GTFS Occupancy enum, and is used to convert numeric values to their string representation.
 OCCUPANCY_STATUS_MAP = ["EMPTY",
@@ -70,9 +72,11 @@ class RealtimeDataFetcher:
 
     def _refresh_delays(self):
         delays = dict()
-        feed = gtfs_realtime_pb2.FeedMessage()
-        response = requests.get(self._tripupdates_url).content
-        feed.ParseFromString(response)
+        feed = self._fetch_feed(self._tripupdates_url, "TripUpdates")
+        if feed is None:
+            # Keep previous data, but mark as updated to avoid hammering the endpoint on every API request.
+            self._delays_last_updated = int(time.time())
+            return
         for entity in feed.entity:
             if entity.HasField('trip_update'):
                 # Handle
@@ -89,9 +93,11 @@ class RealtimeDataFetcher:
     def _refresh_vehicle_position_data(self):
         positions = dict()
         occupancies = dict()
-        feed = gtfs_realtime_pb2.FeedMessage()
-        response = requests.get(self._positions_url).content
-        feed.ParseFromString(response)
+        feed = self._fetch_feed(self._positions_url, "VehiclePositions")
+        if feed is None:
+            # Keep previous data, but mark as updated to avoid hammering the endpoint on every API request.
+            self._positions_last_updated = int(time.time())
+            return
         for entity in feed.entity:
             if entity.HasField('vehicle'):
                 # Handle
@@ -127,4 +133,62 @@ class RealtimeDataFetcher:
         if trip_id not in data:
             # If no data is present, or the value cannot be mapped
             return "UNKNOWN"
-        return OCCUPANCY_STATUS_MAP[data[trip_id]]
+        occupancy_status = data[trip_id]
+        if occupancy_status < 0 or occupancy_status >= len(OCCUPANCY_STATUS_MAP):
+            return "UNKNOWN"
+        return OCCUPANCY_STATUS_MAP[occupancy_status]
+
+    def _fetch_feed(self, url: str, feed_name: str):
+        """
+        Fetch and parse a GTFS-RT protobuf feed.
+        Returns None on fetch/parse errors so callers can fail soft.
+        """
+        try:
+            response = requests.get(
+                url,
+                timeout=20,
+                headers={"Accept-Encoding": "gzip, deflate"}
+            )
+        except requests.RequestException as exc:
+            logging.error("Failed to fetch %s from %s: %s", feed_name, url, exc)
+            return None
+
+        content_type = (response.headers.get("content-type") or "").lower()
+        if response.status_code != 200:
+            preview = response.text[:200].replace("\n", " ")
+            logging.error(
+                "Failed to fetch %s from %s: HTTP %s, content-type=%s, body=%s",
+                feed_name,
+                url,
+                response.status_code,
+                content_type or "unknown",
+                preview
+            )
+            return None
+
+        if "json" in content_type or content_type.startswith("text/"):
+            preview = response.text[:200].replace("\n", " ")
+            logging.error(
+                "Unexpected %s response format from %s: content-type=%s, body=%s",
+                feed_name,
+                url,
+                content_type,
+                preview
+            )
+            return None
+
+        feed = gtfs_realtime_pb2.FeedMessage()
+        try:
+            feed.ParseFromString(response.content)
+        except DecodeError as exc:
+            preview = response.content[:200]
+            text_preview = preview.decode("utf-8", errors="replace").replace("\n", " ")
+            logging.error(
+                "Failed to parse %s protobuf from %s: %s. First bytes (decoded)=%s",
+                feed_name,
+                url,
+                exc,
+                text_preview
+            )
+            return None
+        return feed
