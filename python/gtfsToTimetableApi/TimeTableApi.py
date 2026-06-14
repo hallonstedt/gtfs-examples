@@ -4,7 +4,9 @@ A JSON HTTP API for realtime timetables. Requires a static GTFS feed, VehiclePos
 """
 import json
 import logging
+import os
 import sys
+import threading
 import flask
 from datetime import datetime, timedelta
 
@@ -28,6 +30,45 @@ from RealtimeDataFetcher import RealtimeDataFetcher
 
 app = flask.Flask(__name__)
 
+
+query_engine = None
+query_engine_gtfs_fingerprint = None
+query_engine_lock = threading.RLock()
+
+
+def get_gtfs_fingerprint(gtfs_path):
+	feed_info_path = os.path.join(gtfs_path, "feed_info.txt")
+	feed_info_stat = os.stat(feed_info_path)
+	return (gtfs_path, feed_info_stat.st_mtime_ns, feed_info_stat.st_size)
+
+
+def reload_query_engine(gtfs_path):
+	global query_engine, query_engine_gtfs_fingerprint
+	query_engine = TimeTableQueryEngine(
+		gtfs_path,
+		realtime_data_fetcher,
+		reduce_memory_usage=config.getboolean('Webserver', 'uncached')
+	)
+	query_engine_gtfs_fingerprint = get_gtfs_fingerprint(gtfs_path)
+	logging.info(f"Loaded GTFS query engine from {gtfs_path} with fingerprint {query_engine_gtfs_fingerprint}")
+	return query_engine
+
+
+def get_query_engine():
+	global query_engine_gtfs_fingerprint
+	with query_engine_lock:
+		gtfs_path = GtfsArchiveFetcher.fetch_and_extract(config['URL']['gtfs'], "gtfs/")
+		gtfs_fingerprint = get_gtfs_fingerprint(gtfs_path)
+		if query_engine is None:
+			return reload_query_engine(gtfs_path)
+		if gtfs_fingerprint != query_engine_gtfs_fingerprint:
+			logging.info(
+				f"GTFS archive changed from {query_engine_gtfs_fingerprint} to {gtfs_fingerprint}; reloading query engine"
+			)
+			return reload_query_engine(gtfs_path)
+		return query_engine
+
+
 # Create the webserver and define actions for /departures and /stops
 @app.route('/departures/', defaults={'stop_id': None}, methods=['GET'])  # This route is invoked if we pre-configured a stop in gtfs.conf
 @app.route('/departures/<stop_id>', methods=['GET'])  # This route will be used if we over-ride defsult stop id and add one to the URL
@@ -39,13 +80,12 @@ def departures(stop_id):
 		else:
 			stop_id = config['DEFAULT']['stop_id']
 
-	# Call the static time-table fetcher on every call to ensure that it updates every 24h
-	gtfs_path = GtfsArchiveFetcher.fetch_and_extract(config['URL']['gtfs'], "gtfs/")
+	current_query_engine = get_query_engine()
 	# The TimeTableQueryEngine class does not update the window dynamically so we send updated start and stop times from this call
 	window_start = datetime.now() - timedelta(minutes=10)
 	window_end = datetime.now() + timedelta(hours=config.getint('DEFAULT', 'window_size_hours'))
 	destination_stop_id = flask.request.args.get('destination_stop_id')
-	resp = flask.Response(json.dumps(query_engine.create_departures_timetable(
+	resp = flask.Response(json.dumps(current_query_engine.create_departures_timetable(
 		stop_id,
 		window_start,
 		window_end,
@@ -57,8 +97,8 @@ def departures(stop_id):
 
 @app.route('/stops/', methods=['GET'])
 def stops():
-	gtfs_path = GtfsArchiveFetcher.fetch_and_extract(config['URL']['gtfs'], "gtfs/")
-	resp = flask.Response(json.dumps(query_engine.list_queryable_stops()))
+	current_query_engine = get_query_engine()
+	resp = flask.Response(json.dumps(current_query_engine.list_queryable_stops()))
 	resp.headers['Content-encoding'] = 'UTF-8'
 	resp.headers['Content-type'] = 'Application/json'
 	return resp
@@ -78,7 +118,7 @@ def handle_500_error(e):
 realtime_data_fetcher = RealtimeDataFetcher(config['URL']['trip_updates'], config['URL']['vehicle_positions'])
 # The Archive fetcher will only fetch a new file when needed
 gtfs_path = GtfsArchiveFetcher.fetch_and_extract(config['URL']['gtfs'], "gtfs/")
-query_engine = TimeTableQueryEngine(gtfs_path, realtime_data_fetcher, reduce_memory_usage=config.getboolean('Webserver', 'uncached'))
+reload_query_engine(gtfs_path)
 
 if not config['DEFAULT']['log_level'].upper() == "DEBUG":
     app.config["DEBUG"] = False
